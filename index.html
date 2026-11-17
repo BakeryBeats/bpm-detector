@@ -273,11 +273,24 @@ async function upload() {
     formData.append("file", file);
 
     try {
-        let response = await fetch("https://home-70iz.onrender.com/upload/", {
-            method: "POST",
-            body: formData,
-            signal: controller.signal
-        });
+        let response;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                response = await fetch("https://home-70iz.onrender.com/upload/", {
+                    method: "POST",
+                    body: formData,
+                    signal: controller.signal
+                });
+                if (attempt === 0 && [502, 503, 504].includes(response.status)) {
+                    throw new TypeError("Analysis server temporarily unavailable");
+                }
+                break;
+            } catch (error) {
+                if (error.name === "AbortError" || attempt === 1) throw error;
+                loading.textContent = "The analysis server is restarting. Retrying once…";
+                await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+        }
 
         let data;
         try {
@@ -305,7 +318,7 @@ async function upload() {
         loading.textContent = err.name === "AbortError"
             ? "Analysis timed out. Try again or use a shorter audio file."
             : err instanceof TypeError
-                ? "Cannot reach the analysis server. Check your connection and try again."
+                ? "The analysis server is temporarily unavailable. Please try again shortly."
                 : err.message;
     } finally {
         clearTimeout(timeout);

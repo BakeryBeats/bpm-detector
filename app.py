@@ -3,11 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import librosa
 import tempfile
+import threading
 from pathlib import Path
 import numpy as np
 from starlette.concurrency import run_in_threadpool
 
 app = FastAPI()
+analysis_lock = threading.Lock()
 
 # CORS
 app.add_middleware(
@@ -36,7 +38,16 @@ def detect_bpm(file_path):
         raise ValueError("Use at least 4 seconds of audible music.")
     y = librosa.util.normalize(y)
     hop_length = 256
-    onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+    # Bound spectral-analysis memory even for two-minute stereo masters.
+    chunk_size = (sr * 20 // hop_length) * hop_length
+    onset_chunks = []
+    for start in range(0, len(y), chunk_size):
+        chunk = y[start:start + chunk_size]
+        envelope = librosa.onset.onset_strength(
+            y=chunk, sr=sr, hop_length=hop_length
+        )
+        onset_chunks.append(envelope[:int(np.ceil(len(chunk) / hop_length))])
+    onset = np.concatenate(onset_chunks)
     if np.count_nonzero(onset > 0.1 * np.max(onset)) < 4:
         raise ValueError("No clear rhythm found. Try a section with drums.")
     tempo, beats = librosa.beat.beat_track(
@@ -72,7 +83,9 @@ def analyze_upload(source, suffix):
         if size == 0:
             raise HTTPException(400, "The uploaded file is empty.")
         try:
-            return detect_bpm(filepath)
+            # Concurrent FFT/JIT workloads can exhaust a small Render instance.
+            with analysis_lock:
+                return detect_bpm(filepath)
         except ValueError as error:
             raise HTTPException(422, str(error)) from error
         except Exception as error:
