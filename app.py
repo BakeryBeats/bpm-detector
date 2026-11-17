@@ -1,7 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-import librosa
+import math
+import soundfile as sf
+from scipy import signal
+from scipy.ndimage import uniform_filter1d
 import tempfile
 import threading
 from pathlib import Path
@@ -27,46 +30,68 @@ def home():
 
 
 def detect_bpm(file_path):
-    y, sr = librosa.load(file_path, sr=22050, mono=True, duration=120)
-    if not np.isfinite(y).all() or len(y) < sr * 4:
-        raise ValueError("Use an audio file with at least 4 seconds of music.")
-    if np.max(np.abs(y)) < 1e-5:
-        raise ValueError("This file is silent or too quiet to analyze.")
-
-    y, _ = librosa.effects.trim(y, top_db=40)
-    if len(y) < sr * 4:
-        raise ValueError("Use at least 4 seconds of audible music.")
-    y = librosa.util.normalize(y)
-    hop_length = 256
-    # Bound spectral-analysis memory even for two-minute stereo masters.
-    chunk_size = (sr * 20 // hop_length) * hop_length
+    # Decode and analyze short blocks, keeping memory bounded for long masters.
+    target_rate = 11025
+    hop_length = 128
     onset_chunks = []
-    for start in range(0, len(y), chunk_size):
-        chunk = y[start:start + chunk_size]
-        envelope = librosa.onset.onset_strength(
-            y=chunk, sr=sr, hop_length=hop_length
-        )
-        onset_chunks.append(envelope[:int(np.ceil(len(chunk) / hop_length))])
+    peak = 0.0
+    with sf.SoundFile(file_path) as audio:
+        if len(audio) < audio.samplerate * 4:
+            raise ValueError("Use at least 4 seconds of music.")
+        remaining = min(len(audio), audio.samplerate * 120)
+        divisor = math.gcd(audio.samplerate, target_rate)
+        while remaining > 0:
+            block = audio.read(min(remaining, audio.samplerate * 10), dtype="float32", always_2d=True)
+            if not len(block):
+                break
+            remaining -= len(block)
+            if not np.isfinite(block).all():
+                raise ValueError("This file contains invalid audio samples.")
+            # Select the strongest channel to preserve out-of-phase stereo beats.
+            channel = np.argmax(np.mean(block ** 2, axis=0))
+            mono = block[:, channel]
+            peak = max(peak, float(np.max(np.abs(mono))))
+            mono = signal.resample_poly(
+                mono, target_rate // divisor, audio.samplerate // divisor
+            )
+            _, _, spectrum = signal.stft(
+                mono, fs=target_rate, nperseg=512, noverlap=384
+            )
+            # Positive spectral changes emphasize drum attacks across all bands.
+            magnitude = np.log1p(100 * np.abs(spectrum))
+            flux = np.maximum(np.diff(magnitude, axis=1), 0).mean(axis=0)
+            onset_chunks.append(flux)
+    if peak < 1e-5 or not onset_chunks:
+        raise ValueError("This file is silent or too quiet to analyze.")
     onset = np.concatenate(onset_chunks)
-    if np.count_nonzero(onset > 0.1 * np.max(onset)) < 4:
+    local_average = uniform_filter1d(onset, size=43)
+    onset = np.maximum(onset - local_average, 0)
+    if np.max(onset) < 1e-8:
         raise ValueError("No clear rhythm found. Try a section with drums.")
-    tempo, beats = librosa.beat.beat_track(
-        onset_envelope=onset, sr=sr, hop_length=hop_length, trim=False
-    )
-    bpm = float(np.asarray(tempo).reshape(-1)[0])
-    if not np.isfinite(bpm) or bpm <= 0 or len(beats) < 4:
+    onset /= np.max(onset)
+    frame_rate = target_rate / hop_length
+    minimum_lag = int(np.ceil(60 * frame_rate / 220))
+    maximum_lag = min(int(60 * frame_rate / 40), len(onset) - 2)
+    correlation = signal.fftconvolve(onset, onset[::-1], mode="full")[len(onset) - 1:]
+    correlation /= np.arange(len(onset), 0, -1)
+    candidates, _ = signal.find_peaks(correlation)
+    candidates = candidates[(candidates >= minimum_lag) & (candidates <= maximum_lag)]
+    if not len(candidates):
         raise ValueError("No stable tempo found. Try a section with drums.")
-
-    # Estimate the beat grid across many beats to reduce frame-rounding error.
-    gaps = np.diff(beats)
-    median_gap = np.median(gaps)
-    regular_gaps = np.abs(gaps - median_gap) <= median_gap * 0.15
-    if np.mean(regular_gaps) >= 0.9:
-        frames_per_beat = np.polyfit(np.arange(len(beats)), beats, 1)[0]
-        refined = 60 * sr / (hop_length * frames_per_beat)
-        if abs(refined - bpm) / bpm < 0.05:
-            bpm = refined
-    return round(bpm, 1)
+    tempos = 60 * frame_rate / candidates
+    # A gentle preference resolves nearly equal half/double-time candidates.
+    preference = np.exp(-0.5 * (np.log2(tempos / 100) / 0.8) ** 2)
+    scores = correlation[candidates] * (1 + 0.08 * preference)
+    lag = int(candidates[np.argmax(scores)])
+    if correlation[lag] < correlation[0] * 0.08:
+        raise ValueError("No clear rhythm found. Try a section with drums.")
+    # Interpolate the correlation peak for fractional BPM precision.
+    left, center, right = correlation[lag - 1:lag + 2]
+    curvature = left - 2 * center + right
+    offset = 0.0
+    if abs(curvature) > 1e-12:
+        offset = float(np.clip(0.5 * (left - right) / curvature, -0.5, 0.5))
+    return round(60 * frame_rate / (lag + offset), 1)
 
 
 def analyze_upload(source, suffix):

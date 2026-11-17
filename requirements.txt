@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 gunicorn
-librosa
+scipy
 soundfile
 numpy
 python-multipart
