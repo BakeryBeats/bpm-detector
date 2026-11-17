@@ -141,6 +141,16 @@ button:disabled {
 .progress-container.busy .progress-bar { width: 35%; animation: analyzing 1.2s infinite alternate; }
 @keyframes analyzing { to { transform: translateX(185%); } }
 @media (prefers-reduced-motion: reduce) { .progress-container.busy .progress-bar { animation: none; width: 100%; } }
+.site-link {
+    display: inline-block;
+    margin-top: 14px;
+    color: #ffb347;
+    font-size: 15px;
+    font-weight: bold;
+    text-underline-offset: 4px;
+}
+.site-link:hover { color: #ffd49a; }
+.site-link:focus-visible { outline: 2px solid #ffb347; outline-offset: 6px; }
 </style>
 </head>
 
@@ -176,6 +186,7 @@ button:disabled {
     <div class="alternatives" id="alternatives"></div>
     <p class="note" id="tempoNote" hidden>A rhythm can fit half or double tempo. Choose the pulse that matches your beat.</p>
     <p class="note">MP3 / WAV · up to 100 MB. Analyzes the first 2 minutes.<br>Audio is sent to the analysis server and removed after analysis.</p>
+    <a class="site-link" href="https://www.elroybakker.nl/" target="_blank" rel="noopener">Explore Bakery Beats &amp; Instrumentals →</a>
 </div>
 
 <script>
