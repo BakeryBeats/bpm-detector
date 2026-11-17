@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bakery Beats - BPM Detector</title>
 
 <style>
@@ -12,14 +13,15 @@ body {
     font-family: Arial, sans-serif;
     background: radial-gradient(circle at top, #1a1a1a, #0b0b0b);
     color: white;
-    height: 100vh;
+    min-height: 100vh;
+    padding: 24px 16px;
     display: flex;
     justify-content: center;
     align-items: center;
 }
 
 .card {
-    width: 400px;
+    width: min(440px, 100%);
     background: #151515;
     border-radius: 22px;
     padding: 40px 32px;
@@ -132,6 +134,13 @@ button:disabled {
     font-weight: bold;
     color: #ffb347;
 }
+.note { color: #aaa; font-size: 13px; line-height: 1.5; }
+.alternatives { display: flex; gap: 10px; }
+.alternatives button { margin-top: 12px; background: #29231c; color: #ffb347; }
+.dropzone:focus-visible { outline: 2px solid #ffb347; outline-offset: 4px; }
+.progress-container.busy .progress-bar { width: 35%; animation: analyzing 1.2s infinite alternate; }
+@keyframes analyzing { to { transform: translateX(185%); } }
+@media (prefers-reduced-motion: reduce) { .progress-container.busy .progress-bar { animation: none; width: 100%; } }
 </style>
 </head>
 
@@ -142,7 +151,7 @@ button:disabled {
     <div class="sub">Upload your beat → detect BPM 🎧</div>
 
     <div class="section">
-      <label class="dropzone" id="dropzone">
+      <label class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Choose an audio file">
     <div style="font-size:16px; font-weight:500;">
         Drop your audio here
     </div>
@@ -151,19 +160,22 @@ button:disabled {
         MP3 / WAV supported
     </div>
 
-    <input type="file" id="fileInput">
+    <input type="file" id="fileInput" accept=".mp3,.wav,audio/mpeg,audio/wav">
 </label>
     </div>
 
     <button id="btn" onclick="upload()">Analyze BPM</button>
 
-    <div class="loading" id="loading"></div>
+    <div class="loading" id="loading" role="status" aria-live="polite"></div>
 
     <div class="progress-container" id="progressContainer">
         <div class="progress-bar" id="progressBar"></div>
     </div>
 
-    <div class="result" id="result"></div>
+    <div class="result" id="result" aria-live="polite"></div>
+    <div class="alternatives" id="alternatives"></div>
+    <p class="note" id="tempoNote" hidden>A rhythm can fit half or double tempo. Choose the pulse that matches your beat.</p>
+    <p class="note">MP3 / WAV · up to 100 MB. Analyzes the first 2 minutes.<br>Audio is sent to the analysis server and removed after analysis.</p>
 </div>
 
 <script>
@@ -171,8 +183,26 @@ const fileInput = document.getElementById("fileInput");
 const dropzone = document.getElementById("dropzone");
 const filename = document.getElementById("filename");
 const btn = document.getElementById("btn");
+const alternatives = document.getElementById("alternatives");
+const tempoNote = document.getElementById("tempoNote");
+let busy = false;
+
+function clearResult() {
+    document.getElementById("result").textContent = "";
+    alternatives.replaceChildren();
+    tempoNote.hidden = true;
+    document.getElementById("loading").textContent = "";
+}
+
+dropzone.addEventListener("keydown", (event) => {
+    if ((event.key === "Enter" || event.key === " ") && !busy) {
+        event.preventDefault();
+        fileInput.click();
+    }
+});
 
 fileInput.addEventListener("change", () => {
+    clearResult();
     if (fileInput.files[0]) {
         filename.innerText = "Selected: " + fileInput.files[0].name;
     }
@@ -190,6 +220,8 @@ dropzone.addEventListener("dragleave", () => {
 dropzone.addEventListener("drop", (e) => {
     e.preventDefault();
     dropzone.classList.remove("active");
+    if (busy) return;
+    clearResult();
 
     fileInput.files = e.dataTransfer.files;
 
@@ -199,6 +231,7 @@ dropzone.addEventListener("drop", (e) => {
 });
 
 async function upload() {
+    if (busy) return;
     let file = fileInput.files[0];
 
     if (!file) {
@@ -211,20 +244,30 @@ async function upload() {
     const bar = document.getElementById("progressBar");
     const container = document.getElementById("progressContainer");
 
+    clearResult();
+    if (!/\.(mp3|wav)$/i.test(file.name)) {
+        loading.textContent = "Choose an MP3 or WAV file.";
+        return;
+    }
+    if (!file.size || file.size > 100 * 1024 * 1024) {
+        loading.textContent = "Choose a non-empty file smaller than 100 MB.";
+        return;
+    }
+
+    busy = true;
     btn.disabled = true;
+    fileInput.disabled = true;
+    dropzone.setAttribute("aria-disabled", "true");
     loading.innerText = "Analyzing...";
     result.innerText = "";
 
     container.style.display = "block";
-    bar.style.width = "0%";
-
-    let progress = 0;
-    let interval = setInterval(() => {
-        if (progress < 90) {
-            progress += Math.random() * 6;
-            bar.style.width = progress + "%";
-        }
-    }, 300);
+    container.classList.add("busy");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 180000);
+    const warmup = setTimeout(() => {
+        loading.textContent = "Still analyzing. The server may need time to wake up…";
+    }, 20000);
 
     let formData = new FormData();
     formData.append("file", file);
@@ -232,34 +275,48 @@ async function upload() {
     try {
         let response = await fetch("https://home-70iz.onrender.com/upload/", {
             method: "POST",
-            body: formData
+            body: formData,
+            signal: controller.signal
         });
 
-        let data = await response.json();
-
-        clearInterval(interval);
-        bar.style.width = "100%";
-
-        loading.innerText = "";
-
-        if (data.bpm) {
-            result.innerText = data.bpm + " BPM";
-        } else {
-            result.innerText = "Error";
+        let data;
+        try {
+            data = await response.json();
+        } catch {
+            throw new Error("The analysis server is unavailable. Please try again shortly.");
+        }
+        if (!response.ok || !Number.isFinite(data.bpm) || data.bpm <= 0) {
+            throw new Error(typeof data.detail === "string" ? data.detail : "No tempo found. Try a section with drums.");
         }
 
-    } catch (err) {
-        clearInterval(interval);
         loading.innerText = "";
-        result.innerText = "Server error";
-    }
 
-    setTimeout(() => {
+        result.textContent = data.bpm + " BPM";
+        for (const [label, value] of [["Half", data.bpm / 2], ["Detected", data.bpm], ["Double", data.bpm * 2]]) {
+            const choice = document.createElement("button");
+            const tempo = Math.round(value * 10) / 10;
+            choice.textContent = label + " · " + tempo;
+            choice.addEventListener("click", () => { result.textContent = tempo + " BPM"; });
+            alternatives.append(choice);
+        }
+        tempoNote.hidden = false;
+
+    } catch (err) {
+        loading.textContent = err.name === "AbortError"
+            ? "Analysis timed out. Try again or use a shorter audio file."
+            : err instanceof TypeError
+                ? "Cannot reach the analysis server. Check your connection and try again."
+                : err.message;
+    } finally {
+        clearTimeout(timeout);
+        clearTimeout(warmup);
         container.style.display = "none";
-        bar.style.width = "0%";
-    }, 800);
-
-    btn.disabled = false;
+        container.classList.remove("busy");
+        btn.disabled = false;
+        fileInput.disabled = false;
+        dropzone.removeAttribute("aria-disabled");
+        busy = false;
+    }
 }
 </script>
 
